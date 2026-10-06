@@ -42,10 +42,17 @@ from mcp.types import TextContent
 from mcp.types import Tool as MCPTool
 
 from strix.config import load_settings
+from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.interface.cli_args import get_version
 from strix.interface.utils import derive_local_base_name
+from strix.report.state import ReportState, set_global_report_state
 from strix.runtime import session_manager
-from strix.tools.coverage.tools import list_coverage, record_coverage, update_coverage
+from strix.tools.coverage.tools import (
+    hydrate_coverage_from_disk,
+    list_coverage,
+    record_coverage,
+    update_coverage,
+)
 from strix.tools.load_skill.tool import load_skill
 from strix.tools.proxy.tools import (
     list_requests,
@@ -66,6 +73,7 @@ from strix.tools.reporting.tool import (
 from strix.tools.threat_model.tools import (
     amend_threat_model,
     get_threat_model,
+    hydrate_threat_models_from_disk,
     save_threat_model,
 )
 from strix.tools.web_search.tool import web_get_contents, web_search
@@ -137,6 +145,42 @@ def _sandbox_tool_specs() -> list[FunctionTool]:
 
 SANDBOX_TOOL_NAMES = frozenset(t.name for t in _sandbox_tool_specs())
 
+# Proxy tools read their Caido client from the live sandbox session; the host
+# branch must bring the sandbox up before invoking one, or they report the
+# proxy as unavailable until an unrelated shell call happens to start it.
+PROXY_TOOL_NAMES = frozenset(
+    t.name
+    for t in (
+        list_requests,
+        view_request,
+        repeat_request,
+        list_sitemap,
+        view_sitemap_entry,
+        scope_rules,
+    )
+)
+
+
+def _init_run_state(scan_id: str) -> None:
+    """Wire up host-side run state so the reporting, threat-model, and coverage
+    tools persist to a run directory and survive a server restart, mirroring the
+    native CLI. Without it they return success but keep nothing on disk, and
+    ``list_reports`` stays empty.
+    """
+    run_name = f"mcp-{scan_id}"
+    run_dir = run_dir_for(run_name)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = runtime_state_dir(run_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    report_state = ReportState(run_name)
+    report_state.hydrate_from_run_dir()
+    set_global_report_state(report_state)
+
+    hydrate_coverage_from_disk(state_dir)
+    hydrate_threat_models_from_disk(state_dir)
+    logger.info("Run state ready at %s", run_dir)
+
 
 def _build_local_sources(target_paths: list[str]) -> list[dict[str, Any]]:
     """Turn host repo paths into Strix ``local_sources`` mount entries.
@@ -145,14 +189,24 @@ def _build_local_sources(target_paths: list[str]) -> list[dict[str, Any]]:
     matching how the native CLI mounts a ``--target`` directory.
     """
     sources: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for raw in target_paths:
         resolved = Path(raw).expanduser()
         if not resolved.is_dir():
             raise ValueError(f"--target-path is not a directory: {raw}")
+        # De-duplicate: two repos whose final path component matches would
+        # otherwise share one /workspace/<name> mount and shadow each other.
+        base = derive_local_base_name(str(resolved))
+        subdir = base
+        suffix = 1
+        while subdir in seen:
+            suffix += 1
+            subdir = f"{base}-{suffix}"
+        seen.add(subdir)
         sources.append(
             {
                 "source_path": str(resolved),
-                "workspace_subdir": derive_local_base_name(str(resolved)),
+                "workspace_subdir": subdir,
                 "protect_metadata": True,
             }
         )
@@ -164,8 +218,10 @@ class _SandboxTools:
     it. The session is created on the first call that needs it and reused for
     the life of the server; ``aclose`` tears it down."""
 
-    def __init__(self, local_sources: list[dict[str, Any]] | None = None) -> None:
-        self._scan_id = uuid.uuid4().hex[:8]
+    def __init__(
+        self, local_sources: list[dict[str, Any]] | None = None, scan_id: str | None = None
+    ) -> None:
+        self._scan_id = scan_id or uuid.uuid4().hex[:8]
         self._local_sources = local_sources or []
         self._bundle: dict[str, Any] | None = None
         self._tools: dict[str, FunctionTool] | None = None
@@ -276,6 +332,9 @@ def _build_server(sandbox: _SandboxTools) -> Any:
         tool: FunctionTool | None
         if name in host_tools:
             tool = host_tools[name]
+            # Proxy tools need the live session's Caido client; start it first.
+            if name in PROXY_TOOL_NAMES:
+                await sandbox.ensure()
         elif name in SANDBOX_TOOL_NAMES:
             tool = (await sandbox.ensure()).get(name)
             if tool is None:
@@ -290,7 +349,9 @@ def _build_server(sandbox: _SandboxTools) -> Any:
 
 
 async def _serve(local_sources: list[dict[str, Any]]) -> None:
-    sandbox = _SandboxTools(local_sources=local_sources)
+    scan_id = uuid.uuid4().hex[:8]
+    _init_run_state(scan_id)
+    sandbox = _SandboxTools(local_sources=local_sources, scan_id=scan_id)
     server = _build_server(sandbox)
     init_options = server.create_initialization_options()
     try:

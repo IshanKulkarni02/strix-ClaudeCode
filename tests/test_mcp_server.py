@@ -16,6 +16,7 @@ from agents.tool import FunctionTool
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from strix.interface import mcp_server
+from strix.report.state import get_global_report_state, set_global_report_state
 from strix.tools.load_skill.tool import load_skill
 
 
@@ -172,3 +173,62 @@ def test_no_mount_leaves_instructions_unchanged() -> None:
     sandbox = mcp_server._SandboxTools()
     assert sandbox.workspace_paths == []
     assert mcp_server._server_instructions(sandbox) == mcp_server._INSTRUCTIONS
+
+
+def test_build_local_sources_dedupes_colliding_names(tmp_path: Path) -> None:
+    # Two repos with the same final path component must get distinct mounts,
+    # or one would shadow the other at /workspace/<name>.
+    a = tmp_path / "one" / "api"
+    b = tmp_path / "two" / "api"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    sources = mcp_server._build_local_sources([str(a), str(b)])
+    subdirs = [s["workspace_subdir"] for s in sources]
+    assert subdirs == ["api", "api-2"]
+    assert len(set(subdirs)) == 2
+
+
+def test_init_run_state_wires_global_report_state(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # Without this, reporting/threat-model/coverage tools report success but
+    # persist nothing. _init_run_state must install a global report state and
+    # create the run directory the tools write to.
+    monkeypatch.chdir(tmp_path)
+    try:
+        assert get_global_report_state() is None
+        mcp_server._init_run_state("deadbeef")
+        state = get_global_report_state()
+        assert state is not None
+        run_dir = tmp_path / "strix_runs" / "mcp-deadbeef"
+        assert run_dir.is_dir()
+        assert (run_dir / ".state").is_dir()
+    finally:
+        set_global_report_state(None)
+
+
+@pytest.mark.asyncio
+async def test_proxy_tool_brings_up_sandbox() -> None:
+    # Proxy tools read the Caido client from the live session, so invoking one
+    # must trigger sandbox bring-up even though it is a host tool.
+    class _RecordingSandbox(mcp_server._SandboxTools):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ensure_calls = 0
+
+        async def ensure(self) -> dict[str, FunctionTool]:
+            self.ensure_calls += 1
+            return {}
+
+    sandbox = _RecordingSandbox()
+    server = mcp_server._build_server(sandbox)
+    async with create_connected_server_and_client_session(server) as client:
+        # repeat_request takes a single required arg, so it clears schema
+        # validation and reaches the dispatch that must start the sandbox.
+        result = await client.call_tool("repeat_request", {"request_id": "missing"})
+    assert sandbox.ensure_calls == 1
+    assert result.content and result.content[0].type == "text"
+
+
+def test_proxy_tool_names_are_host_tools() -> None:
+    host_names = {t.name for t in mcp_server._host_tools()}
+    assert mcp_server.PROXY_TOOL_NAMES
+    assert host_names >= mcp_server.PROXY_TOOL_NAMES
