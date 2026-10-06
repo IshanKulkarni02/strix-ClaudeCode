@@ -24,6 +24,7 @@ import json
 import logging
 import sys
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 # ExecCommandTool / WriteStdinTool are not re-exported from the capabilities
@@ -42,6 +43,7 @@ from mcp.types import Tool as MCPTool
 
 from strix.config import load_settings
 from strix.interface.cli_args import get_version
+from strix.interface.utils import derive_local_base_name
 from strix.runtime import session_manager
 from strix.tools.coverage.tools import list_coverage, record_coverage, update_coverage
 from strix.tools.load_skill.tool import load_skill
@@ -136,16 +138,43 @@ def _sandbox_tool_specs() -> list[FunctionTool]:
 SANDBOX_TOOL_NAMES = frozenset(t.name for t in _sandbox_tool_specs())
 
 
+def _build_local_sources(target_paths: list[str]) -> list[dict[str, Any]]:
+    """Turn host repo paths into Strix ``local_sources`` mount entries.
+
+    Each path is mounted read-write at ``/workspace/<name>`` inside the sandbox,
+    matching how the native CLI mounts a ``--target`` directory.
+    """
+    sources: list[dict[str, Any]] = []
+    for raw in target_paths:
+        resolved = Path(raw).expanduser()
+        if not resolved.is_dir():
+            raise ValueError(f"--target-path is not a directory: {raw}")
+        sources.append(
+            {
+                "source_path": str(resolved),
+                "workspace_subdir": derive_local_base_name(str(resolved)),
+                "protect_metadata": True,
+            }
+        )
+    return sources
+
+
 class _SandboxTools:
     """Lazily brings up one Strix sandbox session and binds the shell tools to
     it. The session is created on the first call that needs it and reused for
     the life of the server; ``aclose`` tears it down."""
 
-    def __init__(self) -> None:
+    def __init__(self, local_sources: list[dict[str, Any]] | None = None) -> None:
         self._scan_id = uuid.uuid4().hex[:8]
+        self._local_sources = local_sources or []
         self._bundle: dict[str, Any] | None = None
         self._tools: dict[str, FunctionTool] | None = None
         self._lock = asyncio.Lock()
+
+    @property
+    def workspace_paths(self) -> list[str]:
+        """The ``/workspace/<name>`` paths of the mounted repos, if any."""
+        return [f"/workspace/{s['workspace_subdir']}" for s in self._local_sources]
 
     async def ensure(self) -> dict[str, FunctionTool]:
         async with self._lock:
@@ -160,7 +189,7 @@ class _SandboxTools:
         self._bundle = await session_manager.create_or_reuse(
             self._scan_id,
             image=settings.runtime.image,
-            local_sources=[],
+            local_sources=self._local_sources,
             status_sink=lambda phase: logger.info("sandbox: %s", phase),
         )
         session = self._bundle["session"]
@@ -194,6 +223,7 @@ def _run_context(sandbox: _SandboxTools) -> dict[str, Any]:
         "agent_id": SERVER_NAME,
         "parent_id": None,
         "interactive": False,
+        "scan_targets": sandbox.workspace_paths,
     }
 
 
@@ -211,8 +241,20 @@ async def _invoke(tool: FunctionTool, arguments: dict[str, Any], sandbox: _Sandb
     return json.dumps(result, default=str)
 
 
+def _server_instructions(sandbox: _SandboxTools) -> str:
+    if not sandbox.workspace_paths:
+        return _INSTRUCTIONS
+    mounted = ", ".join(sandbox.workspace_paths)
+    return (
+        f"{_INSTRUCTIONS} The target repository is mounted in the sandbox at: "
+        f"{mounted}. Run the shell tools there for white-box review."
+    )
+
+
 def _build_server(sandbox: _SandboxTools) -> Any:
-    server: Any = Server(SERVER_NAME, version=get_version(), instructions=_INSTRUCTIONS)
+    server: Any = Server(
+        SERVER_NAME, version=get_version(), instructions=_server_instructions(sandbox)
+    )
 
     host_tools = {t.name: t for t in _host_tools()}
 
@@ -247,8 +289,8 @@ def _build_server(sandbox: _SandboxTools) -> Any:
     return server
 
 
-async def _serve() -> None:
-    sandbox = _SandboxTools()
+async def _serve(local_sources: list[dict[str, Any]]) -> None:
+    sandbox = _SandboxTools(local_sources=local_sources)
     server = _build_server(sandbox)
     init_options = server.create_initialization_options()
     try:
@@ -262,6 +304,18 @@ def run_mcp_server(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="strix mcp-server",
         description="Serve Strix's tools to an MCP client over stdio.",
+    )
+    parser.add_argument(
+        "-t",
+        "--target-path",
+        dest="target_paths",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Mount a local repository into the sandbox at /workspace/<name> so "
+            "the shell tools can review its code. Repeatable."
+        ),
     )
     parser.add_argument(
         "-v",
@@ -278,7 +332,12 @@ def run_mcp_server(argv: list[str]) -> int:
     )
 
     try:
-        asyncio.run(_serve())
+        local_sources = _build_local_sources(args.target_paths)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    try:
+        asyncio.run(_serve(local_sources))
     except KeyboardInterrupt:
         return 0
     return 0

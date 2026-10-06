@@ -20,6 +20,8 @@ from strix.tools.load_skill.tool import load_skill
 
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from agents.tool_context import ToolContext
 
 
@@ -138,3 +140,35 @@ def test_build_server_advertises_host_tools() -> None:
 def test_run_mcp_server_rejects_unknown_flag() -> None:
     with pytest.raises(SystemExit):
         mcp_server.run_mcp_server(["--definitely-not-a-flag"])
+
+
+def test_build_local_sources_maps_dirs_to_mounts(tmp_path: Path) -> None:
+    repo = tmp_path / "my-repo"
+    repo.mkdir()
+    sources = mcp_server._build_local_sources([str(repo)])
+    assert len(sources) == 1
+    assert sources[0]["source_path"] == str(repo)
+    assert sources[0]["workspace_subdir"] == "my-repo"
+
+
+def test_build_local_sources_rejects_missing_dir(tmp_path: Path) -> None:
+    missing = tmp_path / "nope"
+    with pytest.raises(ValueError, match="not a directory"):
+        mcp_server._build_local_sources([str(missing)])
+
+
+def test_mounted_repo_appears_in_context_and_instructions(tmp_path: Path) -> None:
+    repo = tmp_path / "target-app"
+    repo.mkdir()
+    sources = mcp_server._build_local_sources([str(repo)])
+    sandbox = mcp_server._SandboxTools(local_sources=sources)
+    assert sandbox.workspace_paths == ["/workspace/target-app"]
+    # Tools scope to the mounted path, and the client is told where it is.
+    assert mcp_server._run_context(sandbox)["scan_targets"] == ["/workspace/target-app"]
+    assert "/workspace/target-app" in mcp_server._server_instructions(sandbox)
+
+
+def test_no_mount_leaves_instructions_unchanged() -> None:
+    sandbox = mcp_server._SandboxTools()
+    assert sandbox.workspace_paths == []
+    assert mcp_server._server_instructions(sandbox) == mcp_server._INSTRUCTIONS
