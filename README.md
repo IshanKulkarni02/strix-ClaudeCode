@@ -354,7 +354,15 @@ Each server's tools are namespaced by `name`, for example `github_list_issues`. 
 
 The reverse of the above: expose Strix's own tools to an MCP client such as Claude Code, Cursor, or Zed. The client supplies the model and the orchestration loop, so this mode needs **no `STRIX_LLM` and no `LLM_API_KEY`** — if you already use Claude Code or another coding agent, Strix rides on that subscription. Strix contributes its sandbox container, the HTTP proxy, the skill packs, and the CVSS-scored reporting tools.
 
-Register it with Claude Code:
+**One-line install for Claude Code** (needs Docker and the `claude` CLI already installed):
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/IshanKulkarni02/strix-ClaudeCode/feat/mcp-server/install-claude-code.sh | bash
+```
+
+That installs the `strix` CLI (installing `uv` first if needed) and registers it as a user-scoped MCP server. Then open Claude Code and ask it to test a target.
+
+To wire it up manually instead, register it with Claude Code:
 
 ```bash
 claude mcp add strix -- strix mcp-server
