@@ -174,6 +174,26 @@ PROXY_TOOL_NAMES = frozenset(
 )
 
 
+def _validate_run_name(run_name: str) -> str:
+    """Return ``run_name`` if it is a single safe path segment, else raise.
+
+    ``run_name`` becomes a directory under ``strix_runs/``. A value with a path
+    separator, a ``..`` segment, an absolute path, or a leading dot could place
+    run files outside that tree or resume an unrelated run, so reject anything
+    that is not a plain name.
+    """
+    name = run_name.strip()
+    if not name:
+        raise ValueError("--run-name must not be empty")
+    if name in {".", ".."} or name.startswith("."):
+        raise ValueError(f"--run-name must not start with a dot: {run_name!r}")
+    if "/" in name or "\\" in name or Path(name).is_absolute():
+        raise ValueError(f"--run-name must be a single path segment: {run_name!r}")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+        raise ValueError("--run-name must not contain control characters")
+    return name
+
+
 def _init_run_state(run_name: str) -> Path:
     """Wire up host-side run state so the reporting, threat-model, and coverage
     tools persist to a run directory and survive a server restart, mirroring the
@@ -335,11 +355,16 @@ def _read_spilled_output(output_id: str, offset: int, length: int) -> str:
     if not path.is_file():
         return f"No saved output named {output_id!r}."
     offset = max(offset, 0)
-    length = length if length > 0 else _MAX_RESULT_CHARS
-    data = path.read_text(encoding="utf-8", errors="replace")
-    chunk = data[offset : offset + length]
-    end = offset + len(chunk)
-    return f"{chunk}\n\n[chars {offset}-{end} of {len(data)}; more available: {end < len(data)}]"
+    # Cap the window so one call can't return the whole file, and read only that
+    # window off disk (seek) rather than loading the whole file into memory.
+    length = min(length, _MAX_RESULT_CHARS) if length > 0 else _MAX_RESULT_CHARS
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        raw = handle.read(length)
+    chunk = raw.decode("utf-8", errors="replace")
+    end = offset + len(raw)
+    return f"{chunk}\n\n[bytes {offset}-{end} of {size}; more available: {end < size}]"
 
 
 async def _invoke(tool: FunctionTool, arguments: dict[str, Any], sandbox: _SandboxTools) -> str:
@@ -360,13 +385,21 @@ async def _invoke(tool: FunctionTool, arguments: dict[str, Any], sandbox: _Sandb
     if len(text) <= _MAX_RESULT_CHARS:
         return text
     output_id = _spill_large_output(tool.name, text)
-    how = (
-        f"; call {_READ_OUTPUT_TOOL} with output_id={output_id!r} to read the rest"
-        if output_id
-        else ""
+    if output_id:
+        preview = text[:_MAX_RESULT_CHARS]
+        return (
+            f"{preview}\n\n[truncated to {_MAX_RESULT_CHARS} of {len(text)} chars; "
+            f"call {_READ_OUTPUT_TOOL} with output_id={output_id!r} to read the rest]"
+        )
+    # The save failed (no run dir, disk full, unwritable), so there is nothing to
+    # page back. Show both ends rather than silently dropping the tail.
+    half = _MAX_RESULT_CHARS // 2
+    head = text[:half]
+    tail = text[-half:]
+    return (
+        f"{head}\n\n[could not save the full output ({len(text)} chars); the middle "
+        f"is omitted — showing the first and last {half} chars]\n\n{tail}"
     )
-    preview = text[:_MAX_RESULT_CHARS]
-    return f"{preview}\n\n[truncated to {_MAX_RESULT_CHARS} of {len(text)} chars{how}]"
 
 
 def _server_instructions(sandbox: _SandboxTools) -> str:
@@ -398,14 +431,19 @@ def _build_server(sandbox: _SandboxTools) -> Any:
         description=(
             "Read back a tool result that was truncated, using the output_id "
             "from the truncation notice. Returns a bounded chunk; page with "
-            "offset and length."
+            f"byte offset and length (length is capped at {_MAX_RESULT_CHARS})."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "output_id": {"type": "string", "description": "Id from the truncation notice."},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
-                "length": {"type": "integer", "minimum": 1, "default": _MAX_RESULT_CHARS},
+                "length": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": _MAX_RESULT_CHARS,
+                    "default": _MAX_RESULT_CHARS,
+                },
             },
             "required": ["output_id"],
         },
@@ -533,7 +571,13 @@ def run_mcp_server(argv: list[str]) -> int:
     # A unique default keeps two servers launched from the same directory from
     # sharing one run and overwriting each other's reports; pass --run-name to
     # deliberately resume or share a run.
-    run_name = args.run_name or f"mcp-{uuid.uuid4().hex[:8]}"
+    if args.run_name is not None:
+        try:
+            run_name = _validate_run_name(args.run_name)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        run_name = f"mcp-{uuid.uuid4().hex[:8]}"
 
     try:
         asyncio.run(_serve(local_sources, run_name))

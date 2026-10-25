@@ -278,6 +278,50 @@ def test_read_spilled_output_rejects_traversal() -> None:
     assert "Invalid output id" in mcp_server._read_spilled_output("a/b.txt", 0, 100)
 
 
+def test_validate_run_name_rejects_traversal_and_separators() -> None:
+    # A run name becomes a directory under strix_runs/; path parts must not escape.
+    for bad in ["../evil", "/abs/path", "a/b", "a\\b", "..", ".", ".hidden", ""]:
+        with pytest.raises(ValueError, match="run-name"):
+            mcp_server._validate_run_name(bad)
+    assert mcp_server._validate_run_name("  my-run  ") == "my-run"
+
+
+@pytest.mark.asyncio
+async def test_read_spilled_output_caps_length_and_pages(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # An over-cap length request is clamped, and reads return only the window.
+    monkeypatch.chdir(tmp_path)
+    mcp_server._init_run_state("mcp-cap")
+    try:
+        body = "y" * (mcp_server._MAX_RESULT_CHARS * 2)
+        output_id = mcp_server._spill_large_output("demo", body)
+        assert output_id
+        over = mcp_server._read_spilled_output(output_id, 0, mcp_server._MAX_RESULT_CHARS * 10)
+        # Response body (minus the trailing notice line) never exceeds the cap.
+        chunk = over.split("\n\n[", 1)[0]
+        assert len(chunk) == mcp_server._MAX_RESULT_CHARS
+        assert "more available: True" in over
+    finally:
+        set_global_report_state(None)
+
+
+@pytest.mark.asyncio
+async def test_invoke_keeps_both_ends_when_save_fails() -> None:
+    # With no run state, the spill save fails; the tail must not be dropped.
+    set_global_report_state(None)
+    big = "A" * (mcp_server._MAX_RESULT_CHARS + 1000) + "ZZZEND"
+
+    class _BigTool:
+        name = "big"
+
+        async def on_invoke_tool(self, _ctx, _args):  # type: ignore[no-untyped-def]
+            return big
+
+    out = await mcp_server._invoke(_BigTool(), {}, mcp_server._SandboxTools())  # type: ignore[arg-type]
+    assert "could not save" in out
+    assert out.startswith("A")
+    assert out.rstrip().endswith("ZZZEND")  # tail preserved
+
+
 @pytest.mark.asyncio
 async def test_read_tool_output_is_advertised_and_callable(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.chdir(tmp_path)
